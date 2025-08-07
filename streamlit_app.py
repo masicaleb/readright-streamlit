@@ -76,25 +76,162 @@ def sign_out() -> None:
 
 
 def call_function(path: str, token: str, body: Optional[Dict[str, Any]] = None) -> Any:
-    """Invoke a route on the Edge Function and return the JSON response."""
+    """
+    Invoke a route on the Supabase Edge Function and return the JSON response.
+
+    This helper wraps requests to the Supabase Edge Function used for text
+    adaptation, history and analytics. The function will attempt to parse
+    the response as JSON and, on failure, provide a helpful error message
+    containing the response status and body. This improves the default
+    behaviour, which previously raised a JSON decoding error like
+    "Expecting value: line 1 column 1 (char 0)" when the response was empty
+    or contained non‑JSON data.
+    """
     url = f"{SUPABASE_URL}/functions/v1/{FUNCTION_SLUG}{path}"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
     try:
         if body is not None:
             resp = requests.post(url, headers=headers, json=body)
         else:
             resp = requests.get(url, headers=headers)
+    except Exception as exc:
+        # Network errors or other issues reaching the endpoint
+        return {"error": f"Failed to call function: {exc}"}
+    # Attempt to parse JSON; if this fails return the raw text for debugging
+    data: Any
+    try:
         data = resp.json()
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        # Provide detailed feedback when the response isn't valid JSON
+        text = resp.text.strip()
+        if not text:
+            text = "<empty response>"
+        return {
+            "error": f"Invalid JSON response (status {resp.status_code}). Response body: {text}"
+        }
+    # Non‑200 responses may still contain useful error information
     if not resp.ok:
+        # Supabase functions typically return an object with an `error` field
         err = data.get("error", data)
         return {"error": err}
     return data
 
 
 def adapt_text(token: str, text: str, config: Dict[str, Any]) -> Any:
-    """Proxy for the adapt-text endpoint."""
+    """
+    Adapt the provided text based on the given configuration.
+
+    By default this function proxies to the Supabase Edge Function at
+    `/adapt-text`. If an OpenAI API key is provided via Streamlit secrets
+    (`st.secrets["OPENAI_API_KEY"]`) or the `OPENAI_API_KEY` environment
+    variable, the function will instead call the OpenAI Chat Completions API
+    directly. This allows users to run the app without a custom Supabase
+    backend and removes the dependency on a separate Edge Function.
+
+    The configuration dictionary should contain at least the following keys:
+
+      - gradeLevel: one of "k", "1", "2", ... "12"
+      - aiModel: one of "basic", "advanced", "premium"
+      - simplifyVocabulary: bool
+      - addDefinitions: bool
+      - shortParagraphs: bool
+      - visualBreaks: bool
+      - comprehensionQuestions: bool
+
+    When calling the OpenAI API directly, the function attempts to map
+    `aiModel` to an appropriate OpenAI model. You can customise this mapping
+    by adjusting the `model_map` defined below.
+    """
+    # First check for an OpenAI API key in Streamlit secrets or env vars
+    openai_key: Optional[str] = None
+    try:
+        # Prefer Streamlit secrets if available
+        if hasattr(st, "secrets") and isinstance(st.secrets, dict):
+            openai_key = st.secrets.get("OPENAI_API_KEY")  # type: ignore[attr-defined]
+    except Exception:
+        # Accessing st.secrets outside of a Streamlit context can raise
+        pass
+    if not openai_key:
+        openai_key = os.getenv("OPENAI_API_KEY")
+
+    if openai_key:
+        # Map ReadRight model choices to OpenAI models. Users can
+        # customise this mapping to suit their OpenAI account access.
+        model_map: Dict[str, str] = {
+            "basic": "gpt-3.5-turbo",
+            "advanced": "gpt-3.5-turbo",
+            "premium": "gpt-4",
+        }
+        openai_model = model_map.get(config.get("aiModel"), "gpt-3.5-turbo")
+        # Build a prompt that instructs the assistant to adapt the text
+        grade = config.get("gradeLevel", "3")
+        user_prompt = f"Rewrite the following text for grade {grade} reading level."
+        if config.get("simplifyVocabulary"):
+            user_prompt += " Simplify vocabulary."
+        if config.get("addDefinitions"):
+            user_prompt += " Include brief definitions for complex words in parentheses immediately after the word."
+        if config.get("shortParagraphs"):
+            user_prompt += " Break the output into shorter paragraphs."
+        if config.get("visualBreaks"):
+            user_prompt += " Add visual breaks such as bullet points or separators where appropriate."
+        if config.get("comprehensionQuestions"):
+            user_prompt += " After the adapted text, include a few comprehension questions about the content."
+        user_prompt += "\n\n" + text
+        system_prompt = (
+            "You are a helpful assistant that adapts educational text for teachers. "
+            "Given a target reading grade level and a piece of text, you rewrite "
+            "the text to match the specified grade while preserving the original meaning."
+        )
+        payload = {
+            "model": openai_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            # Some sensible defaults; you can tweak temperature or max_tokens
+            "temperature": 0.7,
+            "max_tokens": 1024,
+        }
+        headers = {
+            "Authorization": f"Bearer {openai_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+        except Exception as exc:
+            return {"error": f"Failed to call OpenAI API: {exc}"}
+        if not resp.ok:
+            # If the API returns an error, surface the status and body
+            body = resp.text.strip() or "<empty response>"
+            return {"error": f"OpenAI API error (status {resp.status_code}): {body}"}
+        try:
+            data = resp.json()
+            choices = data.get("choices", [])
+            if not choices:
+                return {"error": "OpenAI API returned no choices."}
+            adapted = choices[0]["message"]["content"].strip()
+            meta: Dict[str, Any] = {
+                "model": openai_model,
+            }
+            # Include token usage metadata if available
+            if "usage" in data:
+                meta.update({
+                    "promptTokens": data["usage"].get("prompt_tokens"),
+                    "completionTokens": data["usage"].get("completion_tokens"),
+                    "totalTokens": data["usage"].get("total_tokens"),
+                })
+            return {"adaptedText": adapted, "metadata": meta}
+        except Exception as exc:
+            return {"error": f"Failed to parse OpenAI response: {exc}"}
+    # No OpenAI key: fall back to Supabase Edge Function
     return call_function("/adapt-text", token, {"text": text, "config": config})
 
 
